@@ -1,6 +1,24 @@
 """MCP server for pytsg — exposes TSG hyperspectral data operations as AI-callable tools.
 
-Run with:
+Three operating modes are supported; call get_agent_capabilities first to
+discover which modes are available in the current environment:
+
+Mode 1 — pytsg only (no TSG licence required)
+    Read .tsg/.bip packages directly in Python and run analysis.
+    Start with read_tsg_package or read_tsg_bip_pair.
+
+Mode 2 — pytsg + TSG Desktop (manual)
+    The user operates TSG Desktop by hand; the agent provides step-by-step
+    instructions via get_tsg_manual_instructions and reads the saved results
+    with the standard pytsg tools once the user confirms the save.
+
+Mode 3 — pytsg + TSG Desktop (headless / automated)
+    The agent drives TSGHeadless.exe directly via run_tsg_headless_scalars
+    and run_tsg_headless_export.  Requires TSG Pro (headless edition) with
+    a valid CSIRO licence installed on the host.  Use configure_tsg_desktop
+    to supply the path to the executable if auto-detection fails.
+
+Run the server with:
     pytsg-mcp          # stdio transport (VS Code / Claude Desktop)
     pytsg-mcp --http   # streamable-HTTP transport (web clients)
 
@@ -23,6 +41,7 @@ from mcp.server.fastmcp import FastMCP
 
 from pytsg import parse_tsg
 from pytsg.feature import band_extractor, fit_gaussian, sqm
+from pytsg import tsg_desktop
 
 # ---------------------------------------------------------------------------
 # Server instance
@@ -31,13 +50,27 @@ from pytsg.feature import band_extractor, fit_gaussian, sqm
 mcp = FastMCP(
     "pytsg",
     instructions=(
-        "Use this server to load and analyse TSG (The Spectral Geologist) "
-        "hyperspectral drill-core datasets. "
-        "Start by calling read_tsg_package or read_tsg_bip_pair to load data, "
-        "then call the analysis tools to query spectra, depth headers, and "
-        "mineral-classification scalars."
+        "You are an agent for TSG (The Spectral Geologist) hyperspectral "
+        "drill-core analysis. "
+        "Always start a session by calling get_agent_capabilities to "
+        "understand which operating modes are available. "
+        "Three modes exist: "
+        "(1) pytsg only - pure Python, no TSG licence needed; "
+        "(2) pytsg + TSG Desktop manual - you give the user step-by-step "
+        "GUI instructions via get_tsg_manual_instructions; "
+        "(3) pytsg + TSG headless - you drive TSGHeadless automatically "
+        "via run_tsg_headless_scalars / run_tsg_headless_export. "
+        "After loading data use the analysis tools "
+        "(get_spectra_summary, get_scalars, extract_band_features, etc.) "
+        "to query spectra, depth headers, and mineral-classification scalars."
     ),
 )
+
+# ---------------------------------------------------------------------------
+# TSG desktop installation (mutable singleton, set via configure_tsg_desktop)
+# ---------------------------------------------------------------------------
+
+_tsg_installation: Union[tsg_desktop.TsgInstallation, None] = None
 
 # ---------------------------------------------------------------------------
 # In-process dataset cache  { handle -> TSG | Spectra }
@@ -596,6 +629,357 @@ def get_lidar_profile(handle: str, max_samples: int = 1000) -> dict:
         "truncated": truncated,
     }
 
+
+
+
+# ---------------------------------------------------------------------------
+# Tools — capability discovery and TSG Desktop configuration
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_agent_capabilities(
+    tsg_exe_path: Union[str, None] = None,
+) -> dict:
+    """Detect which operating modes are available in the current environment.
+
+    Always call this tool at the start of a session to understand what is
+    possible before deciding which tools to use.
+
+    **Mode 1** — pytsg only (always available, no TSG licence needed).
+    **Mode 2** — pytsg + TSG Desktop manual guidance (always available;
+        requires the user to have TSG Desktop installed and a licence).
+    **Mode 3** — pytsg + TSG headless automated (available only when
+        TSGHeadless is installed on the host and reachable on PATH, or via
+        the ``TSG_HEADLESS_EXE`` environment variable, or via
+        ``tsg_exe_path``).
+
+    Args:
+        tsg_exe_path: Optional explicit path to the TSGHeadless executable.
+                      Leave empty for auto-detection.
+
+    Returns:
+        Dict describing each mode with ``available`` (bool), ``description``
+        (str), and for Mode 3 the detected executable path and version.
+    """
+    global _tsg_installation
+    caps = tsg_desktop.get_capabilities(tsg_exe_path)
+    if caps["mode_3_pytsg_plus_tsg_headless"]["available"] and not _tsg_installation:
+        _tsg_installation = tsg_desktop.detect_tsg_installation(tsg_exe_path)
+    return caps
+
+
+@mcp.tool()
+def configure_tsg_desktop(
+    exe_path: str,
+    headless_cmd_template: Union[list[str], None] = None,
+) -> dict:
+    """Set the path to the TSGHeadless executable (Mode 3 configuration).
+
+    Call this tool when TSGHeadless is installed at a non-standard location
+    that was not picked up by auto-detection.  You only need to call it once
+    per session.
+
+    Args:
+        exe_path: Absolute path to the ``TSGHeadless`` (or
+            ``TSGHeadless.exe``) binary.
+        headless_cmd_template: Optional custom argument template.  Each
+            element is a string token; the following placeholders are
+            substituted at run time:
+            ``{exe}`` ``{dataset}`` ``{output_dir}`` ``{export_format}``
+            ``{log_file}``.
+            Leave empty to use the default template.
+
+            Default template::
+
+                ["{exe}", "-t", "{dataset}", "-o", "{output_dir}",
+                 "-s", "-e", "{export_format}", "-l", "{log_file}"]
+
+    Returns:
+        Dict confirming the configured path and whether the file exists.
+    """
+    global _tsg_installation
+    p = Path(exe_path).expanduser().resolve()
+    version = tsg_desktop._probe_version(p) if p.exists() else None
+    inst = tsg_desktop.TsgInstallation(exe_path=p, version=version)
+    if headless_cmd_template is not None:
+        inst.headless_cmd_template = headless_cmd_template
+    _tsg_installation = inst
+    return {
+        "configured": True,
+        "exe_path": str(p),
+        "exe_exists": p.exists(),
+        "version": version,
+        "cmd_template": inst.headless_cmd_template,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tools — Mode 2: manual TSG Desktop guidance
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_tsg_manual_instructions(
+    operation: str,
+    dataset_folder: str,
+    output_path: Union[str, None] = None,
+    algorithm_name: Union[str, None] = None,
+    class_name: Union[str, None] = None,
+) -> dict:
+    """Return step-by-step instructions for performing a TSG Desktop operation
+    manually (Mode 2).
+
+    Use this tool when the user has TSG Desktop installed but you cannot or
+    should not drive it programmatically.  The instructions are returned as
+    markdown text that you should present to the user.  After the user
+    confirms they have completed the steps, reload the dataset with
+    ``read_tsg_package`` to pick up any updated scalars.
+
+    Args:
+        operation: One of:
+            ``"run_scalars"`` — compute all registered scalar algorithms,
+            ``"export_csv"``  — export scalar results to a CSV file,
+            ``"view_classification"`` — open a mineral-classification map,
+            ``"apply_algorithm"`` — apply a named processing algorithm.
+        dataset_folder: Path to the TSG package folder the user should open.
+        output_path: Required for ``"export_csv"``.  Suggested output file path.
+        algorithm_name: Required for ``"apply_algorithm"``.  Name of the
+            TSG algorithm to apply (e.g. ``"Feature Extraction"``).
+        class_name: Required for ``"view_classification"``.  Name of the
+            classification scalar to display.
+
+    Returns:
+        Dict with ``operation``, ``instructions`` (markdown), and a
+        ``next_step`` hint for the agent.
+    """
+    op = operation.lower().strip()
+
+    if op == "run_scalars":
+        text = tsg_desktop.manual_guidance_run_scalars(dataset_folder)
+        next_step = (
+            "Wait for the user to confirm they have finished running scalars "
+            "and saving the dataset, then call read_tsg_package to reload "
+            "the updated results."
+        )
+    elif op == "export_csv":
+        if output_path is None:
+            output_path = str(Path(dataset_folder) / "scalars_export.csv")
+        text = tsg_desktop.manual_guidance_export_csv(dataset_folder, output_path)
+        next_step = (
+            f"Wait for the user to confirm they have exported the CSV, "
+            f"then read the file at '{output_path}' with a file-read tool "
+            "or ask the user to share its contents."
+        )
+    elif op == "view_classification":
+        if class_name is None:
+            class_name = "(specify class name)"
+        text = tsg_desktop.manual_guidance_open_class_map(dataset_folder, class_name)
+        next_step = (
+            "Ask the user to describe what they see in the classification map, "
+            "or to export and share the image."
+        )
+    elif op == "apply_algorithm":
+        if algorithm_name is None:
+            algorithm_name = "(specify algorithm name)"
+        text = tsg_desktop.manual_guidance_apply_algorithm(dataset_folder, algorithm_name)
+        next_step = (
+            "Wait for the user to confirm they have applied the algorithm and "
+            "saved the dataset, then call read_tsg_package to reload the results."
+        )
+    else:
+        return {
+            "error": (
+                f"Unknown operation '{operation}'.  "
+                "Valid values: run_scalars, export_csv, "
+                "view_classification, apply_algorithm."
+            )
+        }
+
+    return {
+        "operation": operation,
+        "dataset_folder": dataset_folder,
+        "instructions": text,
+        "next_step": next_step,
+    }
+
+
+@mcp.tool()
+def check_dataset_updated(
+    dataset_folder: str,
+    since_iso: Union[str, None] = None,
+) -> dict:
+    """Check whether the .tsg / .bip files in a dataset folder have been
+    modified recently (useful in Mode 2 to detect when the user has saved
+    from TSG Desktop).
+
+    Args:
+        dataset_folder: Path to the TSG package folder.
+        since_iso: ISO-8601 datetime string (e.g. ``"2024-06-01T12:00:00"``).
+            If supplied, only files modified **after** this time are reported.
+            If omitted, all file modification times are returned.
+
+    Returns:
+        Dict with ``files`` (list of dicts with ``name`` and ``modified``),
+        ``any_updated`` (bool), and ``folder``.
+    """
+    import datetime
+
+    p = Path(dataset_folder).expanduser().resolve()
+    if not p.exists():
+        return {"error": f"Folder not found: {dataset_folder}"}
+
+    since_dt: Union[datetime.datetime, None] = None
+    if since_iso is not None:
+        try:
+            since_dt = datetime.datetime.fromisoformat(since_iso)
+        except ValueError:
+            return {"error": f"Invalid ISO datetime: {since_iso}"}
+
+    tsg_extensions = {".tsg", ".bip", ".dat"}
+    files = []
+    any_updated = False
+    for f in sorted(p.iterdir()):
+        if f.suffix.lower() in tsg_extensions:
+            mtime = datetime.datetime.fromtimestamp(f.stat().st_mtime)
+            updated = since_dt is None or mtime > since_dt
+            if updated:
+                any_updated = True
+            files.append(
+                {
+                    "name": f.name,
+                    "modified": mtime.isoformat(),
+                    "updated_since_check": updated,
+                }
+            )
+
+    return {"folder": str(p), "files": files, "any_updated": any_updated}
+
+
+# ---------------------------------------------------------------------------
+# Tools — Mode 3: TSG headless (automated)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def run_tsg_headless_scalars(
+    dataset_folder: str,
+    output_dir: Union[str, None] = None,
+    timeout_seconds: int = 600,
+) -> dict:
+    """Run TSG scalar processing on a dataset folder using TSGHeadless
+    (Mode 3 — automated).
+
+    TSGHeadless will open the dataset, execute all registered scalar
+    algorithms, write a log file, and exit.  Requires a valid TSG Pro
+    licence.
+
+    Prerequisites:
+        Call ``get_agent_capabilities`` first to confirm Mode 3 is available.
+        If TSGHeadless was not auto-detected, call ``configure_tsg_desktop``
+        to supply its path.
+
+    Args:
+        dataset_folder: Path to the TSG package folder to process.
+        output_dir: Directory for TSGHeadless output files.  Defaults to a
+            subdirectory ``tsg_output`` inside ``dataset_folder``.
+        timeout_seconds: Kill the process after this many seconds (default
+            600).  Increase for large datasets.
+
+    Returns:
+        Dict with ``success``, ``returncode``, ``stdout``, ``stderr``,
+        ``exported_files``, and ``log_file``.  On success, call
+        ``read_tsg_package`` to reload the updated dataset.
+    """
+    global _tsg_installation
+
+    if _tsg_installation is None:
+        _tsg_installation = tsg_desktop.detect_tsg_installation()
+
+    if _tsg_installation is None or not _tsg_installation.is_available():
+        return {
+            "error": (
+                "TSGHeadless executable not found.  "
+                "Set the TSG_HEADLESS_EXE environment variable, place "
+                "TSGHeadless on PATH, or call configure_tsg_desktop first."
+            ),
+            "mode": "3",
+            "fallback": (
+                "Use Mode 2 instead: call get_tsg_manual_instructions with "
+                "operation='run_scalars' to guide the user through running "
+                "scalars in TSG Desktop manually."
+            ),
+        }
+
+    p = Path(dataset_folder).expanduser().resolve()
+    if output_dir is None:
+        out = p / "tsg_output"
+    else:
+        out = Path(output_dir).expanduser().resolve()
+
+    result = tsg_desktop.run_headless(
+        _tsg_installation,
+        dataset=p,
+        output_dir=out,
+        export_format="csv",
+        timeout_seconds=timeout_seconds,
+    )
+    return result.to_dict()
+
+
+@mcp.tool()
+def run_tsg_headless_export(
+    dataset_folder: str,
+    output_dir: Union[str, None] = None,
+    export_format: str = "csv",
+    timeout_seconds: int = 600,
+) -> dict:
+    """Export TSG scalar results using TSGHeadless (Mode 3 — automated).
+
+    Runs TSGHeadless to export the current scalar values from a dataset to
+    the specified format.  Use this after scalars have already been computed
+    (either via a prior ``run_tsg_headless_scalars`` call or by the user
+    running TSG Desktop manually).
+
+    Args:
+        dataset_folder: Path to the TSG package folder.
+        output_dir: Directory for the exported files.  Defaults to
+            ``<dataset_folder>/tsg_output``.
+        export_format: ``"csv"`` (default) or ``"envi"``.
+        timeout_seconds: Process timeout (default 600).
+
+    Returns:
+        Dict with ``success``, ``exported_files``, and ``log_file``.
+    """
+    global _tsg_installation
+
+    if _tsg_installation is None:
+        _tsg_installation = tsg_desktop.detect_tsg_installation()
+
+    if _tsg_installation is None or not _tsg_installation.is_available():
+        return {
+            "error": (
+                "TSGHeadless executable not found.  "
+                "Use Mode 2: call get_tsg_manual_instructions with "
+                "operation='export_csv' to guide the user through "
+                "exporting from TSG Desktop manually."
+            ),
+        }
+
+    p = Path(dataset_folder).expanduser().resolve()
+    if output_dir is None:
+        out = p / "tsg_output"
+    else:
+        out = Path(output_dir).expanduser().resolve()
+
+    result = tsg_desktop.run_headless(
+        _tsg_installation,
+        dataset=p,
+        output_dir=out,
+        export_format=export_format,
+        timeout_seconds=timeout_seconds,
+    )
+    return result.to_dict()
 
 # ---------------------------------------------------------------------------
 # Entry point
