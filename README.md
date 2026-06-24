@@ -64,8 +64,7 @@ For convienience
 ## AI Agent / MCP Server
 
 pytsg ships a built-in [Model Context Protocol (MCP)](https://modelcontextprotocol.io)
-server (`pytsg-mcp`) so that AI coding assistants — including **VS Code GitHub Copilot**
-(agent mode), **Claude Desktop**, and any other MCP-compatible client — can load,
+server (`pytsg-mcp`) so that any MCP-compatible AI assistant or client can load,
 query, and analyse TSG hyperspectral drill-core datasets through natural language.
 
 ### Three operating modes
@@ -99,7 +98,7 @@ pip install "pytsg[agent]"
 
 ### Starting the server
 
-**stdio transport** (used by VS Code and Claude Desktop):
+**stdio transport** (for MCP clients that launch local commands):
 
 ```bash
 pytsg-mcp
@@ -111,21 +110,10 @@ pytsg-mcp
 pytsg-mcp --http --host 127.0.0.1 --port 8765
 ```
 
-### VS Code setup
+### Client setup
 
-This repository ships a `.vscode/mcp.json` file that registers the server
-automatically. Once `pytsg-mcp` is on your `PATH`, open the repository in VS
-Code and enable **GitHub Copilot agent mode** — the pytsg tools will appear
-in Copilot's tool list.
-
-To verify, open the Copilot Chat panel, switch to **Agent** mode, and type:
-
-> Load the TSG package at `example_data/ETG0187` and tell me about the NIR spectra.
-
-### Claude Desktop setup
-
-Add the following block to `~/Library/Application Support/Claude/claude_desktop_config.json`
-(macOS) or the equivalent path on your OS:
+Any MCP-compatible client can connect to `pytsg-mcp` by registering the
+following stdio server definition in its MCP configuration:
 
 ```json
 {
@@ -138,7 +126,12 @@ Add the following block to `~/Library/Application Support/Claude/claude_desktop_
 }
 ```
 
-Restart Claude Desktop and the pytsg tools will be available automatically.
+This repository also ships the same server definition at `.vscode/mcp.json`,
+which can be reused by MCP-aware tools that read workspace configuration files.
+
+To verify the connection, ask your client to:
+
+> Load the TSG package at `example_data/ETG0187` and tell me about the NIR spectra.
 
 ### TSGHeadless setup (Mode 3 only)
 

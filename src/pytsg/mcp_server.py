@@ -19,8 +19,8 @@ Mode 3 — pytsg + TSG Desktop (headless / automated)
     to supply the path to the executable if auto-detection fails.
 
 Run the server with:
-    pytsg-mcp          # stdio transport (VS Code / Claude Desktop)
-    pytsg-mcp --http   # streamable-HTTP transport (web clients)
+    pytsg-mcp          # stdio transport (for MCP-compatible clients)
+    pytsg-mcp --http   # streamable-HTTP transport (for MCP-compatible web clients)
 
 The server keeps an in-process cache of loaded TSG packages so that a
 conversation can load a dataset once and then call analysis tools
