@@ -159,11 +159,9 @@ Agent: [calls configure_tsg_desktop with that path]
        Mode 3 is now active. I can run processing automatically.
 ```
 
-> **Note:** The TSGHeadless command-line interface is proprietary and not
-> publicly documented by CSIRO.  The default flag set (`-t`, `-o`, `-s`,
-> `-e`, `-l`) is based on community knowledge and may vary across TSG
-> versions.  Use `configure_tsg_desktop(headless_cmd_template=[…])` to
-> override the template if needed.
+> **Note:** TSGHeadless flags can vary by version. Use
+> `configure_tsg_desktop(headless_cmd_template=[…])` to override the
+> template if needed.
 
 ---
 
