@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "pytsg": {
+      "type": "stdio",
+      "command": "pytsg-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
