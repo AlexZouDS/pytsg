@@ -10,18 +10,18 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from numpy.core._exceptions import _ArrayMemoryError
 from numpy.typing import NDArray
 from simplejpeg import decode_jpeg, encode_jpeg
-import zarr
-from dhcomp.composite import _greedy_composite
 
+from dhcomp.composite import _greedy_composite
+from typing import Optional
 
 class ClassHeaders(NamedTuple):
     class_number: int
     name: str
     max: int
     classes: "dict[int, str]"
+    colors: list
 
     def map_ints(self, index: NDArray) -> "list[str]":
         outindex: list[str] = []
@@ -37,7 +37,8 @@ class CrasHeader(NamedTuple):
     id: str  # starts with "CoreLog Linescan ".   If it starts with "CoreLog Linescan 1." then it supports compression (otherwise ignore ctype).
     ns: int  # image width in pixels
     nl: int  # image height in lines
-    nb: int  # number of bands (1 or 3  but always 3 for HyLogger 1 / 2 / 3)
+    nb: int  # number of bands (1 or 3  but always 3 for HyLogger 1 / 2 / 3)- added mir tsg for HyLogger 4
+    nb: int  # number of bands (1 or 3  but always 3 for HyLogger 1 / 2 / 3)- added mir tsg for HyLogger 4
     org: int  # interleave (1=BIL  2=BIP  and compressed rasters are always BIP while uncompressed ones are always BIL)
     dtype: int  # datatype (unused  always byte)
     specny: int  # number of linescan lines per dataset sample
@@ -103,9 +104,10 @@ class Spectra:
 @dataclass
 class TSG:
     nir: Spectra
-    tir: Spectra
-    cras: Cras
-    lidar: Union[NDArray, None]
+    tir: Optional[Spectra]
+    mir: Optional[Spectra]
+    cras: Optional[Cras]
+    lidar: Optional[NDArray]
 
     def __repr__(self) -> str:
         tsg_info: str = "This is a TSG file"
@@ -119,6 +121,8 @@ class FilePairs:
     nir_bip: Union[Path, None] = None
     tir_tsg: Union[Path, None] = None
     tir_bip: Union[Path, None] = None
+    mir_tsg: Union[Path, None] = None
+    mir_bip: Union[Path, None] = None
     lidar: Union[Path, None] = None
     cras: Union[Path, None] = None
 
@@ -168,6 +172,14 @@ class FilePairs:
 
     def valid_tir(self) -> bool:
         result = self._get_bip_tsg_pair("tir")
+        if result is None:
+            valid = False
+        else:
+            valid = True
+        return valid
+
+    def valid_mir(self) -> bool:
+        result = self._get_bip_tsg_pair("mir")
         if result is None:
             valid = False
         else:
@@ -244,6 +256,7 @@ def read_cras(
         array_ok: bool = True
         cras: Union[NDArray, zarr.core.Array]  # type: ignore
         if backing_file is not None:
+            import zarr
             # the big file flag decompresses the jpg data into a zarr array
             # with zarr it is important to ensure that you set the chunks appropriately
             # this means that you are aligning the output chunk size to the input chunk size
@@ -265,9 +278,9 @@ def read_cras(
             try:
                 cras = np.zeros((header.nl, header.ns, header.nb), dtype=np.uint8)
                 array_ok = True
-            except _ArrayMemoryError:
+            except numpy.core._exceptions._ArrayMemoryError:
                 print(
-                    "This file is too big to fit inmemory set big_file=True to dump to disk"
+                    "This file is too big to fit in memory set big_file=True to dump to disk"
                 )
                 array_ok = False
                 cras = np.zeros(1, dtype=np.uint8)
@@ -591,7 +604,6 @@ def extract_chips(
 
 def generate_chips(
     filename: Union[str, Path],
-    outfolder: Union[str, Path],
     spectra: Spectra,
     centre_cut: bool = True,
     batch_size: int = 256,
@@ -600,11 +612,6 @@ def generate_chips(
     creates an generator that generates the image tiles the last batch is not guaranteed to be the target size
     avoids having to write to folder, useful for processing files without having to first write to disk.
     """
-    if isinstance(outfolder, str):
-        outfolder = Path(outfolder)
-
-    if not outfolder.exists():
-        outfolder.mkdir()
 
     section_info_format: str = "4f3i"
     tray_info_format: str = "3f2i"
@@ -661,7 +668,7 @@ def generate_chips(
         # no the header contains the chunk dimensions
         # loop over the section
         # it seems that you need to have the sample header information from the
-        # nir/tir spectra we use nir because it should always be there
+        # nir/tir/mir spectra we use nir because it should always be there
         # once we have that information we are going to caculate the number of pixels required
         # in the y direction that represent a single spectrum and the option will also be to dump
         # all the spectra to disk named as H_SAMPLE in a subfolder which will take an impressive amount of space
@@ -918,7 +925,15 @@ def _parse_class_section(section_list: "list[str]", classnumber: int) -> ClassHe
             split_i = i.split(":")
             class_info.update({int(split_i[0]): split_i[1]})
     max_class: int = int(class_names["max"])
-    class_header = ClassHeaders(classnumber, class_names["name"], max_class, class_info)
+
+    colors_list = []
+
+    if "colours" in list(class_names.keys()):
+        colors_list = [int(s) for s in class_names["colours"].split(" ")]
+
+    class_header = ClassHeaders(
+        classnumber, class_names["name"], max_class, class_info, colors=colors_list
+    )
     return class_header
 
 
@@ -1097,7 +1112,10 @@ def _parse_tsg(
 
 
 def _parse_scalars(
-    scalars: NDArray, classes: "list[ClassHeaders]", bandheaders: "list[BandHeaders]"
+    scalars: NDArray,
+    classes: "list[ClassHeaders]",
+    bandheaders: "list[BandHeaders]",
+    nodata: int = -1,
 ) -> pd.DataFrame:
     """
     function to map the scalars to a pandas data frame with names and
@@ -1109,7 +1127,13 @@ def _parse_scalars(
         # handle flag 13 that has a path to plsscalars
         if i.flag == 2:
             if i.class_number > 0:
-                bv = band_value.astype(int)
+                # replace missing values with `nodata (defaulting to -1)
+                # Note: the integer shouldn't exist in the `classes` keys
+                bv = np.where(
+                    np.isclose(band_value, np.finfo("float32").min),
+                    -1,
+                    band_value,
+                ).astype(int)
                 tn = classes[i.class_number].map_ints(bv)
                 tmp_series.append(pd.DataFrame(tn, columns=[i.name]))
             else:
@@ -1164,7 +1188,7 @@ def read_package(
     # we will parse the lidar height data because we can
 
     # process here is to map the files that we need together
-    # tir and nir files
+    # tir and nir files and mir in hylogger 4
     #
     # deal the files to the type
 
@@ -1184,6 +1208,13 @@ def read_package(
         elif f.name.endswith("tsg_tir.bip"):
             setattr(file_pairs, "tir_bip", f)
 
+      
+        elif f.name.endswith("tsg_mir.tsg"):
+            setattr(file_pairs, "mir_tsg", f)
+
+        elif f.name.endswith("tsg_mir.bip"):
+            setattr(file_pairs, "mir_bip", f)
+
         elif f.name.endswith("tsg_cras.bip"):
             setattr(file_pairs, "cras", f)
 
@@ -1196,9 +1227,10 @@ def read_package(
     # for the nir/swir and then tir
     # read nir/swir
     nir: Spectra
-    tir: Spectra
-    lidar: Union[NDArray, None]
-    cras: Cras
+    mir: Optional[Spectra]
+    tir: Optional[Spectra]
+    lidar: Optional[NDArray]
+    cras: Optional[Cras] = None
 
     if file_pairs.valid_nir():
         nir = read_tsg_bip_pair(file_pairs.nir_tsg, file_pairs.nir_bip, "nir")
@@ -1209,6 +1241,12 @@ def read_package(
         tir = read_tsg_bip_pair(file_pairs.tir_tsg, file_pairs.tir_bip, "tir")
     else:
         tir = Spectra
+
+    if file_pairs.valid_mir():
+        mir = read_tsg_bip_pair(file_pairs.mir_tsg, file_pairs.mir_bip, "mir")
+    else:
+        mir = Spectra
+
     if file_pairs.valid_lidar():
         lidar = read_hires_dat(file_pairs.lidar)
     else:
@@ -1226,14 +1264,12 @@ def read_package(
 
             extract_chips(file_pairs.cras, imageoutput, nir)
             cras = Cras
-        else:
-            cras = read_cras(file_pairs.cras, backing_file)
-
+        cras = read_cras(file_pairs.cras, backing_file)
     else:
         cras = Cras
 
-    return TSG(nir, tir, cras, lidar)
-
+    return TSG(nir,tir,mir, cras, lidar)
+    
 
 if __name__ == "main":
     foldername = "data/RC_hyperspectral_geochem"
