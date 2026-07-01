@@ -7,10 +7,12 @@ pytsg is an open source one function utility that imports the spectral geologist
 
 ## Installation
 Installation is via pip
-```pip install pytsg```
+
+    pip install pytsg
 
 To also install the AI-agent MCP server:
-```pip install "pytsg[agent]"```
+
+    pip install "pytsg[agent]"
 
 ## Usage
 
