@@ -57,3 +57,6 @@ lidar = parse_tsg.read_lidar('ETG0187_tsg_hires.dat')
 For convienience 
 ## Thanks
 Thanks to CSIRO and in particular Andrew Rodger for his assistance in decoding the file structures.
+
+## Supported by the Geoscience Open Maintainers Collective
+This project is supported by the Geoscience Open Maintainers Collective, an initiative of Geoscience Data Integrations (GDI), the open data and software division of the Geological Survey of Western Australia (GSWA). The Collective provides targeted developer support to open geoscience software projects; working alongside maintainers to share the maintenance load and help keep community tools stable, usable, and accessible.
